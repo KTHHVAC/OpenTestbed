@@ -1,0 +1,262 @@
+#include <Timer.h>
+#include "app_profile.h"
+#include "printf.h"
+#include "UserButton.h"
+
+module EasyCollectionC {
+  uses interface Boot;
+  uses interface SplitControl as RadioControl;
+  uses interface StdControl as RoutingControl;
+  uses interface Send;
+  uses interface Leds;
+  uses interface Timer<TMilli>;
+  uses interface RootControl;
+  uses interface Receive;
+  
+  //serial forwarding
+  uses interface SplitControl as SerialControl;
+  uses interface AMSend;
+  uses interface Packet as SerialPacket;
+  
+  //Temp and Humi Sensors
+  uses interface Read<uint16_t> as ReadTemp; 
+  uses interface Read<uint16_t> as ReadHumi;
+
+  //ADC  
+  uses interface Resource;
+  uses interface Msp430Adc12MultiChannel as MultiChannel;
+  provides interface AdcConfigure<const msp430adc12_channel_config_t*>;
+  //UserButton
+  uses interface Notify<button_state_t> as UserButton;
+}
+
+implementation {
+
+const msp430adc12_channel_config_t config = {
+		INPUT_CHANNEL_A5, REFERENCE_VREFplus_AVss, REFVOLT_LEVEL_1_5,
+		SHT_SOURCE_ACLK, SHT_CLOCK_DIV_1, SAMPLE_HOLD_4_CYCLES,
+		SAMPCON_SOURCE_SMCLK, SAMPCON_CLOCK_DIV_1};
+
+  message_t packet;
+  message_t sf_pkt;
+  message_t radio_pkt;
+  sf_msg* sf_payload;
+  radio_msg* Radio_payload;
+  bool sendBusy = FALSE;
+  bool locked = FALSE;
+  //bool FirstReceived[20];
+  uint8_t Node_id;
+  //uint16_t data[4];//radio sending
+  uint16_t Data[4];//serial forwarding
+  uint16_t tempdata=0;
+  uint16_t humidata=0;
+  uint16_t lightdata=0;
+  uint16_t co2data=0;
+  uint16_t buffer[10];
+  uint16_t *data_ADC;
+  //uint16_t Nsend=1;
+  //uint16_t Nrcv[20];
+  //uint16_t Ncheck[20];
+  //uint8_t i;
+
+ task void SerialSendTask();
+ task void sendMessageTask();
+ 
+  event void Boot.booted() {
+    if (TOS_NODE_ID == COORDINATOR_ADDRESS)
+{   
+    call UserButton.enable();
+}
+
+   else {
+    call RadioControl.start();
+        }
+    /*for (i=0;i<20;i++)
+   {  
+       Nrcv[i]=1;
+       Ncheck[i]=0;
+       FirstReceived[i]=FALSE;
+   }*/
+  }
+
+ event void UserButton.notify( button_state_t state ) {
+    if ( state == BUTTON_PRESSED ) {
+    } else if ( state == BUTTON_RELEASED ) {
+      call RadioControl.start();
+    }
+  }
+
+async command const msp430adc12_channel_config_t* AdcConfigure.getConfiguration()
+	{
+		return &config;
+	}
+
+
+event void Resource.granted()
+	{
+		adc12memctl_t memctl[] = { {INPUT_CHANNEL_A2, REFERENCE_VREFplus_AVss}};
+		if (call MultiChannel.configure(&config, memctl, 1, buffer, 10,0) == SUCCESS) {
+			call MultiChannel.getData();
+		}
+	}
+ 
+
+  event void RadioControl.startDone(error_t err) {
+    if (err != SUCCESS)
+      call RadioControl.start();
+    else {
+      call RoutingControl.start();
+      if (TOS_NODE_ID == COORDINATOR_ADDRESS) 
+	{
+        call RootControl.setRoot();
+        call SerialControl.start(); 
+        sf_payload = (sf_msg*)call SerialPacket.getPayload(&sf_pkt, sizeof(sf_msg));
+        sf_payload->SrcType = 1; // 1:mote  2:PLC
+        }
+      else{
+	call Timer.startPeriodic(30000);
+        //call SerialControl.start();
+}
+    }
+  }
+
+  event void RadioControl.stopDone(error_t err) {}
+
+  task void sendMessageTask() {
+    radio_msg* msg =
+      (radio_msg*)call Send.getPayload(&packet, sizeof(radio_msg));
+    msg->Node_ID = TOS_NODE_ID;
+    msg->data1 = tempdata;
+    msg->data3 = lightdata; 
+    msg->data2 = humidata;
+    msg->data4 = co2data;
+    //msg->Npkt_send = Nsend;
+   // printf("%u\n", TOS_NODE_ID);
+    //printfflush();
+ if (call Send.send(&packet, sizeof(radio_msg)) != SUCCESS) 
+     {call Leds.led0On();
+     }
+    else 
+      {sendBusy = TRUE;
+       call Leds.led1Off();
+       call Leds.led2Toggle(); }	
+  }
+
+  event void Timer.fired() {
+    if (!sendBusy){  
+
+                call ReadTemp.read();
+                call ReadHumi.read();
+
+               if (!call Resource.isOwner()) {
+					call Resource.request();
+				        post sendMessageTask();
+				}
+				else {
+					call MultiChannel.getData();
+					post sendMessageTask();
+				}
+    }
+  }
+
+//when data is ready
+	async event void MultiChannel.dataReady(uint16_t *buf, uint16_t numSamples)
+	{
+	atomic {
+		data_ADC = buf;
+		co2data=(data_ADC[1]+data_ADC[3]+data_ADC[5]+data_ADC[7]+data_ADC[9])/5;
+                lightdata=(data_ADC[0]+data_ADC[2]+data_ADC[4]+data_ADC[6]+data_ADC[8])/5;		
+}
+          }
+
+
+ event void ReadHumi.readDone(error_t result, uint16_t data)
+  {
+    if(result == SUCCESS){
+      humidata = data;
+    }
+  }
+
+  event void ReadTemp.readDone(error_t result, uint16_t data)
+  {
+    if(result == SUCCESS){
+      tempdata = data;
+    }
+  }
+  
+  event void Send.sendDone(message_t* m, error_t err) {
+    if (err != SUCCESS) 
+      {call Leds.led0On();}
+    sendBusy = FALSE; 
+ //   Nsend=Nsend+1;   
+   }
+  
+  event message_t* Receive.receive(message_t* msg, void* payload, uint8_t len) {
+     call Leds.led1Toggle();
+     if (TOS_NODE_ID == COORDINATOR_ADDRESS) 
+	{
+        if (len == sizeof(radio_msg)) {
+        radio_msg* Radio_payload =(radio_msg*) payload;
+        atomic {
+                Node_id=Radio_payload->Node_ID;
+                Data[0]=Radio_payload->data1;
+                Data[1]=Radio_payload->data2;
+                Data[2]=Radio_payload->data3;
+                Data[3]=Radio_payload->data4;
+              //  Ncheck[Node_id]=Radio_payload->Npkt_send;
+               }
+        }
+         /* if (Ncheck[Node_id]==1) 
+                {Nrcv[Node_id]=1;} 
+ 
+          if (Ncheck[Node_id]<Nrcv[Node_id])
+                {Nrcv[Node_id]=Ncheck[Node_id];}
+ 
+          if (!FirstReceived[Node_id])
+                {
+                Nrcv[Node_id]=Ncheck[Node_id];
+                FirstReceived[Node_id] = TRUE; 
+                }
+       */
+        sf_payload->Node_ID = Node_id;
+        sf_payload->data1 = Data[0];
+        sf_payload->data2 = Data[1];
+        sf_payload->data3 = Data[2];
+        sf_payload->data4 = Data[3];
+        //sf_payload->Npkt_rcv = Nrcv[Node_id];
+        //sf_payload->Npkt_send = Ncheck[Node_id];
+        //sf_payload->Npkt_loss = Ncheck[Node_id]-Nrcv[Node_id];
+        //Nrcv[Node_id]=Nrcv[Node_id]+1;
+        post SerialSendTask();
+        }  
+    return msg;
+  }
+
+
+
+task void SerialSendTask()
+        {   
+  if(locked){
+      return;
+     }else{
+       if(sf_payload == NULL) {return;}
+       if(call SerialPacket.maxPayloadLength() < sizeof(sf_msg)){
+       return;
+	}
+      if(call AMSend.send(AM_BROADCAST_ADDR, &sf_pkt, sizeof(sf_msg)) == SUCCESS){
+	locked = TRUE;
+      }
+    }
+   }
+ 
+event void AMSend.sendDone(message_t* bufPtr, error_t error){
+    if(&sf_pkt == bufPtr){
+      locked = FALSE;
+    }
+  }
+
+  event void SerialControl.startDone(error_t err){}
+
+  event void SerialControl.stopDone(error_t err){}
+
+}
