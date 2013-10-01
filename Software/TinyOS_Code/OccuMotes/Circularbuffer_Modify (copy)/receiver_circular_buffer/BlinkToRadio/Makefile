@@ -1,0 +1,6 @@
+COMPONENT=BlinkToRadioAppC
+
+CFLAGS +=-DENABLE_SPI0_DMA
+
+include $(MAKERULES)
+
